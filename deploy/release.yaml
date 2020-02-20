@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gc-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: gc-operator
+  template:
+    metadata:
+      labels:
+        name: gc-operator
+    spec:
+      serviceAccountName: gc-operator
+      containers:
+        - name: gc-operator
+          image: "skybig/gc-operator:latest"
+          command:
+          - gc-operator
+          imagePullPolicy: Always
