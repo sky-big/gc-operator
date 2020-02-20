@@ -537,7 +537,7 @@ func getFixes(fset *token.FileSet, f *ast.File, filename string, env *ProcessEnv
 	// derive package names from import paths, see if the file is already
 	// complete. We can't add any imports yet, because we don't know
 	// if missing references are actually package vars.
-	p := &pass{fset: fset, f: f, srcDir: srcDir}
+	p := &pass{fset: fset, f: f, srcDir: srcDir, env: env}
 	if fixes, done := p.load(); done {
 		return fixes, nil
 	}
@@ -559,8 +559,7 @@ func getFixes(fset *token.FileSet, f *ast.File, filename string, env *ProcessEnv
 	}
 
 	// Third pass: get real package names where we had previously used
-	// the naive algorithm. This is the first step that will use the
-	// environment, so we provide it here for the first time.
+	// the naive algorithm.
 	p = &pass{fset: fset, f: f, srcDir: srcDir, env: env}
 	p.loadRealPackageNames = true
 	p.otherFiles = otherFiles
@@ -629,10 +628,42 @@ func getCandidatePkgs(ctx context.Context, wrappedCallback *scanCallback, filena
 			return notSelf(pkg) && wrappedCallback.packageNameLoaded(pkg)
 		},
 		exportsLoaded: func(pkg *pkg, exports []string) {
+			// If we're an x_test, load the package under test's test variant.
+			if strings.HasSuffix(filePkg, "_test") && pkg.dir == filepath.Dir(filename) {
+				var err error
+				_, exports, err = loadExportsFromFiles(ctx, env, pkg.dir, true)
+				if err != nil {
+					return
+				}
+			}
 			wrappedCallback.exportsLoaded(pkg, exports)
 		},
 	}
 	return env.GetResolver().scan(ctx, scanFilter)
+}
+
+func ScoreImportPaths(ctx context.Context, env *ProcessEnv, paths []string) map[string]int {
+	result := make(map[string]int)
+	for _, path := range paths {
+		result[path] = env.GetResolver().scoreImportPath(ctx, path)
+	}
+	return result
+}
+
+func PrimeCache(ctx context.Context, env *ProcessEnv) error {
+	// Fully scan the disk for directories, but don't actually read any Go files.
+	callback := &scanCallback{
+		rootFound: func(gopathwalk.Root) bool {
+			return true
+		},
+		dirFound: func(pkg *pkg) bool {
+			return false
+		},
+		packageNameLoaded: func(pkg *pkg) bool {
+			return false
+		},
+	}
+	return getCandidatePkgs(ctx, callback, "", "", env)
 }
 
 func candidateImportName(pkg *pkg) string {
@@ -718,6 +749,8 @@ type ProcessEnv struct {
 	LocalPrefix string
 	Debug       bool
 
+	BuildFlags []string
+
 	// If non-empty, these will be used instead of the
 	// process-wide values.
 	GOPATH, GOROOT, GO111MODULE, GOPROXY, GOFLAGS, GOSUMDB string
@@ -727,6 +760,13 @@ type ProcessEnv struct {
 	Logf func(format string, args ...interface{})
 
 	resolver Resolver
+}
+
+// CopyConfig copies the env's configuration into a new env.
+func (e *ProcessEnv) CopyConfig() *ProcessEnv {
+	copy := *e
+	copy.resolver = nil
+	return &copy
 }
 
 func (e *ProcessEnv) env() []string {
@@ -783,8 +823,13 @@ func (e *ProcessEnv) buildContext() *build.Context {
 	return &ctx
 }
 
-func (e *ProcessEnv) invokeGo(args ...string) (*bytes.Buffer, error) {
-	cmd := exec.Command("go", args...)
+func (e *ProcessEnv) invokeGo(verb string, args ...string) (*bytes.Buffer, error) {
+	goArgs := []string{verb}
+	if verb != "env" {
+		goArgs = append(goArgs, e.BuildFlags...)
+	}
+	goArgs = append(goArgs, args...)
+	cmd := exec.Command("go", goArgs...)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	cmd.Stdout = stdout
@@ -814,6 +859,10 @@ func cmdDebugStr(cmd *exec.Cmd) string {
 
 func addStdlibCandidates(pass *pass, refs references) {
 	add := func(pkg string) {
+		// Prevent self-imports.
+		if path.Base(pkg) == pass.f.Name.Name && filepath.Join(pass.env.GOROOT, "src", pkg) == pass.srcDir {
+			return
+		}
 		exports := copyExports(stdlib[pkg])
 		pass.addCandidate(
 			&ImportInfo{ImportPath: pkg},
@@ -842,7 +891,9 @@ type Resolver interface {
 	scan(ctx context.Context, callback *scanCallback) error
 	// loadExports returns the set of exported symbols in the package at dir.
 	// loadExports may be called concurrently.
-	loadExports(ctx context.Context, pkg *pkg) (string, []string, error)
+	loadExports(ctx context.Context, pkg *pkg, includeTest bool) (string, []string, error)
+	// scoreImportPath returns the relevance for an import path.
+	scoreImportPath(ctx context.Context, path string) int
 
 	ClearForNewScan()
 }
@@ -1192,7 +1243,7 @@ func (r *gopathResolver) scan(ctx context.Context, callback *scanCallback) error
 		if !callback.packageNameLoaded(p) {
 			return
 		}
-		if _, exports, err := r.loadExports(ctx, p); err == nil {
+		if _, exports, err := r.loadExports(ctx, p, false); err == nil {
 			callback.exportsLoaded(p, exports)
 		}
 	}
@@ -1220,6 +1271,13 @@ func (r *gopathResolver) scan(ctx context.Context, callback *scanCallback) error
 	return nil
 }
 
+func (r *gopathResolver) scoreImportPath(ctx context.Context, path string) int {
+	if _, ok := stdlib[path]; ok {
+		return MaxRelevance
+	}
+	return MaxRelevance - 1
+}
+
 func filterRoots(roots []gopathwalk.Root, include func(gopathwalk.Root) bool) []gopathwalk.Root {
 	var result []gopathwalk.Root
 	for _, root := range roots {
@@ -1231,11 +1289,11 @@ func filterRoots(roots []gopathwalk.Root, include func(gopathwalk.Root) bool) []
 	return result
 }
 
-func (r *gopathResolver) loadExports(ctx context.Context, pkg *pkg) (string, []string, error) {
-	if info, ok := r.cache.Load(pkg.dir); ok {
+func (r *gopathResolver) loadExports(ctx context.Context, pkg *pkg, includeTest bool) (string, []string, error) {
+	if info, ok := r.cache.Load(pkg.dir); ok && !includeTest {
 		return r.cache.CacheExports(ctx, r.env, info)
 	}
-	return loadExportsFromFiles(ctx, r.env, pkg.dir)
+	return loadExportsFromFiles(ctx, r.env, pkg.dir, includeTest)
 }
 
 // VendorlessPath returns the devendorized version of the import path ipath.
@@ -1251,7 +1309,7 @@ func VendorlessPath(ipath string) string {
 	return ipath
 }
 
-func loadExportsFromFiles(ctx context.Context, env *ProcessEnv, dir string) (string, []string, error) {
+func loadExportsFromFiles(ctx context.Context, env *ProcessEnv, dir string, includeTest bool) (string, []string, error) {
 	var exports []string
 
 	// Look for non-test, buildable .go files which could provide exports.
@@ -1262,7 +1320,7 @@ func loadExportsFromFiles(ctx context.Context, env *ProcessEnv, dir string) (str
 	var files []os.FileInfo
 	for _, fi := range all {
 		name := fi.Name()
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		if !strings.HasSuffix(name, ".go") || (!includeTest && strings.HasSuffix(name, "_test.go")) {
 			continue
 		}
 		match, err := env.buildContext().MatchFile(dir, fi.Name())
@@ -1293,6 +1351,10 @@ func loadExportsFromFiles(ctx context.Context, env *ProcessEnv, dir string) (str
 		if f.Name.Name == "documentation" {
 			// Special case from go/build.ImportDir, not
 			// handled by MatchFile above.
+			continue
+		}
+		if includeTest && strings.HasSuffix(f.Name.Name, "_test") {
+			// x_test package. We want internal test files only.
 			continue
 		}
 		pkgName = f.Name.Name
@@ -1360,7 +1422,9 @@ func findImport(ctx context.Context, pass *pass, candidates []pkgDistance, pkgNa
 				if pass.env.Debug {
 					pass.env.Logf("loading exports in dir %s (seeking package %s)", c.pkg.dir, pkgName)
 				}
-				exports, err := loadExportsForPackage(ctx, pass.env, pkgName, c.pkg)
+				// If we're an x_test, load the package under test's test variant.
+				includeTest := strings.HasSuffix(pass.f.Name.Name, "_test") && c.pkg.dir == pass.srcDir
+				_, exports, err := pass.env.GetResolver().loadExports(ctx, c.pkg, includeTest)
 				if err != nil {
 					if pass.env.Debug {
 						pass.env.Logf("loading exports in dir %s (seeking package %s): %v", c.pkg.dir, pkgName, err)
@@ -1395,17 +1459,6 @@ func findImport(ctx context.Context, pass *pass, candidates []pkgDistance, pkgNa
 		return pkg, nil
 	}
 	return nil, nil
-}
-
-func loadExportsForPackage(ctx context.Context, env *ProcessEnv, expectPkg string, pkg *pkg) ([]string, error) {
-	pkgName, exports, err := env.GetResolver().loadExports(ctx, pkg)
-	if err != nil {
-		return nil, err
-	}
-	if expectPkg != pkgName {
-		return nil, fmt.Errorf("dir %v is package %v, wanted %v", pkg.dir, pkgName, expectPkg)
-	}
-	return exports, err
 }
 
 // pkgIsCandidate reports whether pkg is a candidate for satisfying the
