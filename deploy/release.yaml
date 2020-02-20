@@ -15,7 +15,7 @@ spec:
       serviceAccountName: gc-operator
       containers:
         - name: gc-operator
-          image: "skybig/gc-operator:0.0.1"
+          image: "skybig/gc-operator:0.0.5"
           command:
           - gc-operator
           imagePullPolicy: Always

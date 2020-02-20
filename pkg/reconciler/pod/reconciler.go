@@ -19,8 +19,8 @@ const (
 )
 
 const (
-	NodeFinalizerName = "Node-Finalizer"
-	NetworkFinalizerName = "Network-Finalizer"
+	NodeFinalizerName = "finalizers.jdcloud.com/node"
+	NetworkFinalizerName = "finalizers.jdcloud.com/network"
 )
 
 type Reconciler struct {
@@ -44,9 +44,12 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 
 	// Get pod resource with this namespace/name
 	original, err := c.podLister.Pods(namespace).Get(name)
+	if err != nil {
+		return nil
+	}
 	p := original.DeepCopy()
 
-	logger.Infof("Reconcile Pod Resource %+v", original)
+	logger.Infof("Reconcile Pod(%s) Resource Finalizers : %v", p.Name, p.Finalizers)
 
 	if original.GetDeletionTimestamp().IsZero() {
 		// 1. 如果Pod没有被调度且该Pod对应的Node节点没有被创建则创建该节点
