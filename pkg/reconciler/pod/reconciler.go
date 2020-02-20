@@ -81,7 +81,9 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 			}
 		}
 	} else {
-		// 1. pod将要被删除，在此处根据node垃圾回收信息，将node资源回收
+		// 1. 删除该pod对应的node
+
+		// 2. pod将要被删除，在此处根据node垃圾回收信息，将node资源回收
 		if containsString(p.Finalizers, NodeFinalizerName) {
 			p.Finalizers = removeString(p.Finalizers, NodeFinalizerName)
 			if _, err := c.client.CoreV1().Pods(namespace).Update(p); err != nil {
@@ -92,7 +94,9 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 			}
 		}
 
-		// 2. pod将要被删除，在此处根据弹性网卡回收信息，将弹性网卡回收
+		// 3. 删除该pod对应的弹性网卡
+
+		// 4. pod将要被删除，在此处根据弹性网卡回收信息，将弹性网卡回收
 		if containsString(p.Finalizers, NetworkFinalizerName) {
 			p.Finalizers = removeString(p.Finalizers, NetworkFinalizerName)
 			if _, err := c.client.CoreV1().Pods(namespace).Update(p); err != nil {

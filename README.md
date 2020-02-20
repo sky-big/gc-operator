@@ -1,4 +1,4 @@
-# Kubernetes CRD Controller
+# GC Operator
 
 ## Overview
 
