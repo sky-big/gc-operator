@@ -7,6 +7,3 @@ kubectl delete -f ${WORK_DIR}/release.yaml
 
 # delete pulsar cluster operator account and role
 kubectl delete -f ${WORK_DIR}/rbac/all_namespace_rbac.yaml
-
-# delete pulsar cluster crd
-kubectl delete -f ${WORK_DIR}/crds/crds.yaml

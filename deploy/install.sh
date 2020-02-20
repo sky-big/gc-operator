@@ -2,9 +2,6 @@
 
 export WORK_DIR=$(cd `dirname $0`; pwd)
 
-# create pulsar cluster crd
-kubectl create -f ${WORK_DIR}/crds/crds.yaml
-
 # create pulsar cluster operator account and role
 kubectl create -f ${WORK_DIR}/rbac/all_namespace_rbac.yaml
 
